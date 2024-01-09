@@ -1,104 +1,158 @@
 #include <ctime>
 #include <curses.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
+#include <unistd.h>
 
 // block layout is: {w-1,h-1}{x0,y0}{x1,y1}{x2,y2}{x3,y3} (two bits each)
-int x = 431424, y = 598356, r = 427089, px = 247872, py = 799248, pr,
-    c = 348480, p = 615696, tick, board[20][10],
-    block[7][4] = {{x, y, x, y},
-                   {r, p, r, p},
-                   {c, c, c, c},
-                   {599636, 431376, 598336, 432192},
-                   {411985, 610832, 415808, 595540},
-                   {px, py, px, py},
-                   {614928, 399424, 615744, 428369}},
-    score = 0;
+int x = 431424, // 方块x轴坐标
+    y = 598356, // 方块y轴坐标
+    r = 427089, // 某一种方块的具体那种形式 (同一个类别的方块可以经过旋转)
+    px = 247872, // 记录上一次的x 信息
+    py = 799248, // 记录上一次的y 信息
+    pr,          // 记录上一次的r 信息
+    c = 348480,  // 中间变量
+    p = 615696, // 记录方块的类别， 也记录了每种方块的颜色信息,颜色信息=p+1
+    tick,       // 控制帧率 控制下落的速度
+    board[20][10], // 整个地图(画面),有无方块、方块的颜色信息
+    // {h-1,w-1}{x0,y0}{x1,y1}{x2,y2}{x3,y3} (two bits each) //
+    // 方块(高,宽)和四小方块的坐标(先转二进制再按每两位读取)
+    //
+    // 大表 总共有7种类别的方块 每种方块有4种旋转类型(有重复)
+    block[7][4] = {{x, y, x, y},                      // 异Z型
+                   {r, p, r, p},                      // Z型
+                   {c, c, c, c},                      // O型
+                   {599636, 431376, 598336, 432192},  // 异L型
+                   {411985, 610832, 415808, 595540},  // L型
+                   {px, py, px, py},                  // I型
+                   {614928, 399424, 615744, 428369}}, // T型
+    score = 0;                                        // 得分
 
 // extract a 2-bit number from a block entry
+/******
+****
+* @param x 某种类型方块的旋转类型
+ @param y 要取的两位为y+1 和 y+2
+* return int 某两位的值 说明：
+* 从方块表种获取某种旋转类型的方块的特定位的值(p决定是那种方块) ************/
 int NUM(int x, int y) { return 3 & block[p][x] >> y; }
 
 // create a new piece, don't remove old one (it has landed and should stick)
+/*********** @func: 产生一个新的方块 ***********/
 void new_piece() {
-  y = py = 0;
-  p = rand() % 7;
-  r = pr = rand() % 4;
-  x = px = rand() % (10 - NUM(r, 16));
+  y = py = 0;     // 新的块,重置y和py
+  p = rand() % 7; // 方块的类别是7种的随机一种，随机一种
+  r = pr = rand() % 4; // 旋转类型也是四种的随机一种，随机一种旋转
+  x = px = rand() % (10 - NUM(r, 16)); // 随机位置
+  // 17,18位 x坐标是屏幕宽度-块的宽度之间的随机数
+  // NUM(r, 16)获取方块的宽度 根据方块类型、方块旋转类型 获取方块的宽度
 }
 
 // draw the board and score
+/*********** @func: 遍历 board 数组，在相应的位置画出对应颜色的块 ***********/
 void frame() {
   for (int i = 0; i < 20; i++) {
-    move(1 + i, 1); // otherwise the box won't draw
+    move(1 + i, 1); // otherwise the box won't draw // 到新的一行
     for (int j = 0; j < 10; j++) {
       board[i][j] && attron(262176 | board[i][j] << 8);
+      // 如果board[i][j]非0 则进行后面的语句
+      // board[i][j] « 8 等价于 COLOR_PAIR(board[i][j]) // 262176实际上应为
+      // 262144 为 A_REVERSE 将前景色和背景色对换
       printw("  ");
+      // 上一句设置输出的颜色属性，下一句关闭设置的的颜色，为下次绘制做准备
       attroff(262176 | board[i][j] << 8);
     }
   }
-  move(21, 1);
-  printw("Score: %d", score);
-  refresh();
+  move(21, 1);                // 将光标移至 (new_y, new_x)
+  printw("Score: %d", score); // 打印得分
+  refresh(); // 立即更新显示（将实际屏幕与之前的绘制/删除方法进行同步）
 }
 
 // set the value fo the board for a particular (x,y,r) piece
+/**********
+@func： 给board数组(地图) 赋值，
+ 在地图上表示出某个方块的位置信息(具体方块类型由全局变量p指定)
+ @param x 要绘制的x坐标
+ @param y 要绘制的y坐标
+ @param r 旋转的类型
+ @param v 具体的值， 非0 表示方块的颜色信息 0 表示擦除这个方块
+ **********/
 void set_piece(int x, int y, int r, int v) {
+  // 遍历该方块的二进制信息得到小方块坐标,再用加上(x,y)修正其坐标为board坐标系,记录颜色v
   for (int i = 0; i < 8; i += 2) {
+    // 每个数据由2位表示，所以步进为2
     board[NUM(r, i * 2) + y][NUM(r, (i * 2) + 2) + x] = v;
   }
 }
 
 // move a piece from old (p*) coords to new
+/************ @func: 擦除旧的方块在新的位置绘制 **********/
 int update_piece() {
   set_piece(px, py, pr, 0);
+  // 擦除原位置，在判断是否能够放下的时候要把自己影响消除，置0
   set_piece(px = x, py = y, pr = r, p + 1);
+  // 块的类别加1为颜色信息， x,y为当前的新位置,并更新px,py
 }
 
 // remove line(s) from the board if they're full
+/************ @func: 判断一行是否已经满了， 如果满了清除满的行，并得分
+ * ************/
 void remove_line() {
   for (int row = y; row <= y + NUM(r, 18); row++) {
-    c = 1;
+    // 遍历的范围为当前方块的顶部到底部
+    c = 1; // 中间变量
     for (int i = 0; i < 10; i++) {
+      // 遍历一行
       c *= board[row][i];
     }
     if (!c) {
+      // 为 0 表示一行中出现了0，没有满
       continue;
     }
     for (int i = row - 1; i > 0; i--) {
       memcpy(&board[i + 1][0], &board[i][0], 40);
+      // 如果满了，就将 上一行，依次向下一行移 // (out_write, in_read, value)
     }
-    memset(&board[0][0], 0, 10);
-    score++;
+    memset(&board[0][0], 0, 10); // 将最顶行清空
+    score++;                     // 得分
   }
 }
 
 // check if placing p at (x,y,r) will be a collision
+/*********** @func: 判断将方块放置在x,y位置是否会冲突 return int 0为无冲突
+ * ***************/
 int check_hit(int x, int y, int r) {
   if (y + NUM(r, 18) > 19) {
+    // 方块的底部已经超出了屏幕 // NUM(r, 18)获取方块高度
     return 1;
   }
-  set_piece(px, py, pr, 0);
+  set_piece(px, py, pr, 0); // 清空当前方块，清除自己的影响
   c = 0;
   for (int i = 0; i < 8; i += 2) {
     board[y + NUM(r, i * 2)][x + NUM(r, (i * 2) + 2)] && c++;
+    // 判断本方块要放置的四个位置 是否已经有了别的方块
   }
-  set_piece(px, py, pr, p + 1);
-  return c;
+  set_piece(px, py, pr, p + 1); // 在原位置重新放置
+  return c;                     // 如果c == 0 表示可以放置
 }
 
 // slowly tick the piece y position down so the piece falls
+/**********
+ * @func: 控制方块下落 return int 0为游戏结束, 1为游戏继续
+ * ***************/
 int do_tick() {
   if (++tick > 30) {
     tick = 0;
-    if (check_hit(x, y + 1, r)) {
+    if (check_hit(x, y + 1, r)) { // 不能放置到下一行
       if (!y) {
+        // y == 0 游戏结束
         return 0;
       }
-      remove_line();
-      new_piece();
+      remove_line(); // 判断是否已经满了
+      new_piece();   // 在开头创建新的块
     } else {
-      y++;
+      y++; // 可以放置到下一行
       update_piece();
     }
   }
@@ -106,56 +160,82 @@ int do_tick() {
 }
 
 // main game loop with wasd input checking
+/************ @func: 游戏主循环， wasd 按键处理 w: 旋转 ************/
 void runloop() {
+  // 3. 游戏是否结束
   while (do_tick()) {
+    // 把进程挂起一段时间， 单位是微秒（百万分之一秒）；游戏速度
     usleep(10000);
+    // 如果输入 a，左移
     if ((c = getch()) == 'a' && x > 0 && !check_hit(x - 1, y, r)) {
       x--;
     }
+    // 如果输入 d，右移
     if (c == 'd' && x + NUM(r, 16) < 9 && !check_hit(x + 1, y, r)) {
       x++;
     }
+    // 如果输入 s，移动到底部
     if (c == 's') {
-      while (!check_hit(x, y + 1, r)) {
+      // 循环移动到底部
+      while (!check_hit(x, y + 1, r)) { // 向下没有冲突就一直向下
         y++;
         update_piece();
       }
-      remove_line();
+      remove_line(); // 判断是否清除
       new_piece();
     }
+    // 如果输入 w，旋转
     if (c == 'w') {
-      ++r %= 4;
+      ++r %= 4; // 旋转
       while (x + NUM(r, 16) > 9) {
+        // 横坐标超出了边界
         x--;
       }
       if (check_hit(x, y, r)) {
+        // 如果变型后发生了碰撞，则不能变形，x还是原来的x, r还是原来的r
         x = px;
         r = pr;
       }
     }
+    // 如果输入 q，退出
     if (c == 'q') {
       return;
     }
+
+    // 更新方块位置
     update_piece();
+    // 刷新屏幕
     frame();
   }
 }
 
 // init curses and start runloop
 int main() {
-  srand(time(0));
-  initscr();
+
+  // curses 初始化 curses 库
+  initscr(); // 初始化屏幕使之开始进入curses图形化工作方式
+  // curses 初始化curses库的颜色功能
   start_color();
-  // colours indexed by their position in the block
+  // curses colours indexed by their position in the block
   for (int i = 1; i < 8; i++) {
     init_pair(i, i, 0);
+    // curses
+    // 更改某个颜色对的定义,接受参数为(要更改的颜色对编号,前景色编号,背景色编号)
   }
-  new_piece();
-  resizeterm(22, 22);
-  noecho();
+
+  resizeterm(22, 22); // curses 将标准窗口和当前窗口的大小调整为指定的尺寸
+  noecho(); // curses 关闭终端回显功能
+  // curses 为窗口非阻塞读取行为,当没有输入在等待时 getch() 将返回 -1.
   timeout(0);
-  curs_set(0);
-  box(stdscr, 0, 0);
-  runloop();
-  endwin();
+  curs_set(0);       // curses 设置光标状态为可见
+  box(stdscr, 0, 0); // curses 在窗口边缘绘制边框
+
+  // 0. 随机数种子
+  srand(time(0)); // 随机数种子
+  // 1. 创建一个新方块
+  new_piece(); // 创建一个新方块(未绘制)
+  // 2. 开始游戏
+  runloop(); // 流程主循环
+
+  endwin(); // curses 关闭curses库,终端恢复正常
 }
